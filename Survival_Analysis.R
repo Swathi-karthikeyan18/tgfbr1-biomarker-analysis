@@ -5,7 +5,6 @@
 getwd()
 setwd("D:\\TNBC\\Code_correction")
 
-
 # 1. LIBRARIES -----------------------------------------------------------------
 library(TCGAbiolinks)
 library(SummarizedExperiment)
