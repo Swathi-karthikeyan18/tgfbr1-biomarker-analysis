@@ -1,0 +1,51 @@
+library(GEOquery)
+library(Biobase)
+library(AnnotationDbi)
+library(hgu133plus2.db)
+library(mclust)
+
+output_dir <- "D:/TNBC_RAW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# 1. Load GSE54002
+gse <- getGEO("GSE54002", GSEMatrix = TRUE)[[1]]
+pheno <- pData(gse)
+tumor_samples <- pheno$geo_accession[grepl("tumor", pheno$`tumor/nontumor:ch1`, ignore.case = TRUE)]
+eset_tumor <- gse[, tumor_samples]
+expr_mat <- exprs(eset_tumor)
+
+# 2. Extract Probe IDs
+probe_ids <- select(hgu133plus2.db, keys = rownames(expr_mat), columns = c("SYMBOL"), keytype = "PROBEID")
+esr1_probe  <- na.omit(probe_ids$PROBEID[probe_ids$SYMBOL == "ESR1"])[1]
+pgr_probe   <- na.omit(probe_ids$PROBEID[probe_ids$SYMBOL == "PGR"])[1]
+erbb2_probe <- na.omit(probe_ids$PROBEID[probe_ids$SYMBOL == "ERBB2"])[1]
+
+# 3. Fit 2-component Gaussian mixture model for each marker
+fit_esr1  <- Mclust(expr_mat[esr1_probe, ], G = 2)
+fit_pgr   <- Mclust(expr_mat[pgr_probe, ], G = 2)
+fit_erbb2 <- Mclust(expr_mat[erbb2_probe, ], G = 2)
+
+# Determine which cluster corresponds to the "low/negative" expression group (smaller mean)
+esr1_neg_cluster  <- which.min(fit_esr1$parameters$mean)
+pgr_neg_cluster   <- which.min(fit_pgr$parameters$mean)
+erbb2_neg_cluster <- which.min(fit_erbb2$parameters$mean)
+
+# 4. Identify TNBC samples (samples classified as low/negative across all 3 markers)
+tnbc_ids <- names(which(
+  fit_esr1$classification == esr1_neg_cluster &
+    fit_pgr$classification == pgr_neg_cluster &
+    fit_erbb2$classification == erbb2_neg_cluster
+))
+
+non_tnbc_ids <- setdiff(colnames(expr_mat), tnbc_ids)
+
+# 5. Extract and Save
+gse54002_tnbc_matrix     <- expr_mat[, tnbc_ids]
+gse54002_non_tnbc_matrix <- expr_mat[, non_tnbc_ids]
+
+write.csv(gse54002_tnbc_matrix,     file.path(output_dir, "GSE54002_TNBC_matrix.csv"),     row.names = TRUE)
+write.csv(gse54002_non_tnbc_matrix, file.path(output_dir, "GSE54002_Non_TNBC_matrix.csv"), row.names = TRUE)
+
+cat("Mclust Partitioning Results:\n",
+    "TNBC samples identified:", length(tnbc_ids), "\n",
+    "Non-TNBC samples identified:", length(non_tnbc_ids), "\n")
