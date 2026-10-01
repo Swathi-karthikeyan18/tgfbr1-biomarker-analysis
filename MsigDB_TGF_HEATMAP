@@ -1,0 +1,152 @@
+library(limma)
+library(msigdbr)
+library(dplyr)
+library(data.table)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# ==============================================================================
+# STEP 1: Derive Ground-Truth Sample Annotations directly from Raw Files
+# ==============================================================================
+cat("--- STEP 1: Reading True Sample IDs from GSE54002 Subtype Matrices ---\n")
+
+# Read column headers (Sample IDs) from the physical split files
+gse54002_non_tnbc_dt <- fread(file.path(output_dir, "GSE54002_Non_TNBC_matrix.csv"), nrows = 1)
+gse54002_tnbc_dt     <- fread(file.path(output_dir, "GSE54002_TNBC_matrix.csv"), nrows = 1)
+
+# Extract actual Sample IDs (excluding Gene_Symbol column)
+true_nontnbc_ids <- colnames(gse54002_non_tnbc_dt)[-1]
+true_tnbc_ids    <- colnames(gse54002_tnbc_dt)[-1]
+
+cat("Found", length(true_nontnbc_ids), "Non-TNBC samples and", length(true_tnbc_ids), "TNBC samples in raw GSE54002 files.\n")
+
+# Load Master Batch-Corrected Expression Matrix
+expr_dt  <- fread(file.path(output_dir, "Master_Raw_Aligned_Expression_Matrix.csv"))
+gene_ids <- expr_dt$Gene_Symbol
+expr_mat <- as.matrix(expr_dt[, -1, with = FALSE])
+rownames(expr_mat) <- gene_ids
+
+# Map Ground Truth Group Assignment based strictly on physical sample membership
+master_metadata <- master_metadata %>%
+  mutate(
+    Group = case_when(
+      Sample_ID %in% true_nontnbc_ids ~ "Non_TNBC",
+      Sample_ID %in% true_tnbc_ids    ~ "TNBC",
+      TRUE                            ~ Group  # Keep external cohorts as defined
+    )
+  )
+
+# Explicitly align metadata rows with expression matrix columns
+master_metadata <- master_metadata[match(colnames(expr_mat), master_metadata$Sample_ID), ]
+
+cat("\nVerified Sample Counts across Full Cohort (N = 920):\n")
+print(table(master_metadata$Group))
+
+# ==============================================================================
+# STEP 2: Direct Differential Expression Analysis via limma
+# ==============================================================================
+cat("\n--- STEP 2: Executing Direct limma Differential Analysis ---\n")
+
+group  <- factor(master_metadata$Group, levels = c("Non_TNBC", "TNBC"))
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+
+fit <- lmFit(expr_mat, design)
+contrast_matrix <- makeContrasts(TNBC_vs_NonTNBC = TNBC - Non_TNBC, levels = design)
+fit_bayes <- eBayes(contrasts.fit(fit, contrast_matrix))
+
+deg_full <- topTable(fit_bayes, number = Inf, adjust.method = "BH")
+
+# ==============================================================================
+# STEP 3: MSigDB TGF-beta Network Extraction & Export
+# ==============================================================================
+cat("--- STEP 3: Filtering TGF-Beta Hallmark Network ---\n")
+
+tgf_hallmark_genes <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  filter(gs_name == "HALLMARK_TGF_BETA_SIGNALING") %>%
+  pull(gene_symbol)
+
+tgf_in_data   <- intersect(tgf_hallmark_genes, rownames(deg_full))
+tgf_deg_table <- deg_full[tgf_in_data, ] %>% na.omit() %>% arrange(adj.P.Val)
+
+tgf_summary <- data.frame(
+  Gene_Symbol        = rownames(tgf_deg_table),
+  logFC              = round(tgf_deg_table$logFC, 3),
+  Average_Expression = round(tgf_deg_table$AveExpr, 3),
+  t_Statistic        = round(tgf_deg_table$t, 3),
+  P_Value            = formatC(tgf_deg_table$P.Value, format = "e", digits = 3),
+  FDR_adj_P          = formatC(tgf_deg_table$adj.P.Val, format = "e", digits = 3),
+  Regulation         = ifelse(tgf_deg_table$logFC > 0, "Up in TNBC", "Up in Non-TNBC")
+)
+
+write.csv(tgf_summary, file.path(output_dir, "MSigDB_TGF_Beta_TNBC_vs_NonTNBC_GroundTruthLimma.csv"), row.names = FALSE)
+cat("Summary table saved to:", file.path(output_dir, "MSigDB_TGF_Beta_TNBC_vs_NonTNBC_GroundTruthLimma.csv"), "\n\n")
+
+# ==============================================================================
+# STEP 4: Render Subtype-Clustered Heatmap (Non-TNBC vs TNBC)
+# ==============================================================================
+cat("--- STEP 4: Rendering Clustered Heatmap ---\n")
+
+# Sort metadata explicitly: Non-TNBC on Left, TNBC on Right
+meta_sorted <- master_metadata[order(master_metadata$Group, master_metadata$Batch), ]
+tgf_genes   <- tgf_summary$Gene_Symbol
+tgf_expr    <- expr_mat[tgf_genes, meta_sorted$Sample_ID]
+
+# Compute Row-wise Z-Score Normalization
+tgf_zscore <- t(scale(t(tgf_expr)))
+
+# Annotation palettes
+sub_counts <- table(meta_sorted$Group)
+col_annotation <- HeatmapAnnotation(
+  Subtype = meta_sorted$Group,
+  Cohort  = meta_sorted$Batch,
+  col     = list(
+    Subtype = c("Non_TNBC" = "#2166AC", "TNBC" = "#B2182B"),
+    Cohort  = c(
+      "GSE54002"         = "#4DAF4A",
+      "GSE54002_NonTNBC" = "#4DAF4A",
+      "GSE54002_TNBC"    = "#377EB8", 
+      "GSE157284"        = "#A65628", 
+      "GSE167213"        = "#FF7F00", 
+      "GSE58812"         = "#FFFF33", 
+      "GSE83937"         = "#984EA3", 
+      "GSE95700"         = "#F781BF"
+    )
+  ),
+  annotation_name_side = "left",
+  annotation_name_gp   = gpar(fontsize = 10, fontface = "bold")
+)
+
+ht_plot <- Heatmap(
+  tgf_zscore,
+  name = "Z-Score",
+  col  = colorRamp2(c(-2, 0, 2), c("#2166AC", "#F7F7F7", "#B2182B")),
+  
+  top_annotation        = col_annotation,
+  cluster_rows          = TRUE,
+  cluster_columns       = TRUE,
+  cluster_column_slices = FALSE,
+  show_column_dend      = FALSE,
+  show_row_dend         = TRUE,
+  show_column_names     = FALSE,
+  show_row_names        = TRUE,
+  row_names_gp          = gpar(fontsize = 8, fontface = "italic"),
+  
+  column_split          = factor(meta_sorted$Group, levels = c("Non_TNBC", "TNBC")),
+  column_title          = paste0("MSigDB TGF-β Signaling: Non-TNBC (N=", sub_counts["Non_TNBC"], ") vs TNBC (N=", sub_counts["TNBC"], ")"),
+  column_title_gp       = gpar(fontsize = 11, fontface = "bold"),
+  
+  heatmap_legend_param  = list(title = "Expression\nZ-Score")
+)
+
+# Export high-resolution PNG and PDF
+png(file.path(output_dir, "TGF_Beta_Heatmap_GroundTruth.png"), width = 12, height = 9, units = "in", res = 300)
+draw(ht_plot, merge_legend = TRUE)
+dev.off()
+
+pdf(file.path(output_dir, "TGF_Beta_Heatmap_GroundTruth.pdf"), width = 12, height = 9)
+draw(ht_plot, merge_legend = TRUE)
+dev.off()
+
+cat("Analysis complete! Plots and DEG table exported using exact file-derived sample IDs.\n")
