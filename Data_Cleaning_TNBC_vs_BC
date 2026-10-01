@@ -1,0 +1,216 @@
+library(GEOquery)
+library(Biobase)
+library(AnnotationDbi)
+library(hgu133plus2.db)
+library(limma)
+library(sva)
+library(data.table)
+library(ggplot2)
+library(gridExtra)
+
+# Define working directory
+output_dir <- "D:/TNBC_RAW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ------------------------------------------------------------------------------
+# STEP 1: Define Target Cohorts & Exact GSE54002 Partition Lists
+# ------------------------------------------------------------------------------
+# 85 TNBC GSM IDs from GSE54002
+tnbc_gsm_gse54002 <- c(
+  "GSM1305326", "GSM1305334", "GSM1305335", "GSM1305336", "GSM1305338", "GSM1305340", "GSM1305341", "GSM1305347",
+  "GSM1305350", "GSM1305356", "GSM1305360", "GSM1305362", "GSM1305375", "GSM1305376", "GSM1305377", "GSM1305384",
+  "GSM1305385", "GSM1305391", "GSM1305394", "GSM1305395", "GSM1305401", "GSM1305402", "GSM1305409", "GSM1305415",
+  "GSM1305417", "GSM1305418", "GSM1305421", "GSM1305422", "GSM1305428", "GSM1305435", "GSM1305436", "GSM1305437",
+  "GSM1305438", "GSM1305444", "GSM1305449", "GSM1305456", "GSM1305457", "GSM1305461", "GSM1305464", "GSM1305465",
+  "GSM1305467", "GSM1305468", "GSM1305476", "GSM1305478", "GSM1305509", "GSM1305514", "GSM1305523", "GSM1305525",
+  "GSM1305530", "GSM1305542", "GSM1305561", "GSM1305562", "GSM1305566", "GSM1305574", "GSM1305575", "GSM1305579",
+  "GSM1305587", "GSM1305609", "GSM1305635", "GSM1305643", "GSM1305645", "GSM1305650", "GSM1305651", "GSM1305655",
+  "GSM1305658", "GSM1305660", "GSM1305661", "GSM1305688", "GSM1305694", "GSM1305708", "GSM1305711", "GSM1305712",
+  "GSM1305715", "GSM1305718", "GSM1305719", "GSM1305729", "GSM1305732", "GSM1305734", "GSM1305738", "GSM1305745",
+  "GSM1305746", "GSM1305749", "GSM1305750", "GSM1305751", "GSM1305752"
+)
+
+# Helper function: Convert probe IDs to Gene Symbols and average duplicates
+process_matrix_to_symbols <- function(eset) {
+  mat <- exprs(eset)
+  
+  # Auto Log2 transformation if data is raw intensity
+  qx <- as.numeric(quantile(mat, c(0., 0.25, 0.5, 0.75, 0.99, 1.0), na.rm = TRUE))
+  if (qx[5] > 100 || (qx[6] - qx[1] > 50 && qx[2] > 0)) {
+    mat[mat <= 0] <- 1
+    mat <- log2(mat)
+  }
+  
+  # Map Probes to Gene Symbols using platform db
+  symbols <- mapIds(
+    hgu133plus2.db,
+    keys = rownames(mat),
+    column = "SYMBOL",
+    keytype = "PROBEID",
+    multiVals = "first"
+  )
+  
+  valid <- !is.na(symbols)
+  mat <- mat[valid, ]
+  symbols <- symbols[valid]
+  
+  # Collapse duplicate gene symbols using mean expression
+  mat_gene <- avereps(mat, ID = symbols)
+  return(mat_gene)
+}
+
+# ------------------------------------------------------------------------------
+# STEP 2: Download & Extract Cohorts in Exact Order
+# ------------------------------------------------------------------------------
+cat("--- STEP 2: Loading raw datasets from GEO ---\n")
+
+# 1. GSE54002 Processing
+gse54002_obj <- getGEO("GSE54002", GSEMatrix = TRUE)[[1]]
+pheno_54002  <- pData(gse54002_obj)
+
+# Exclude normal tissues (keep 419 primary tumors)
+tumor_samples_54002 <- pheno_54002$geo_accession[grepl("tumor", pheno_54002$`tumor/nontumor:ch1`, ignore.case = TRUE)]
+gse54002_obj <- gse54002_obj[, tumor_samples_54002]
+
+gse54002_gene_mat <- process_matrix_to_symbols(gse54002_obj)
+
+# Split into Non-TNBC (334) and TNBC (85)
+gse54002_tnbc_cols    <- intersect(colnames(gse54002_gene_mat), tnbc_gsm_gse54002)
+gse54002_nontnbc_cols <- setdiff(colnames(gse54002_gene_mat), gse54002_tnbc_cols)
+
+mat_gse54002_nontnbc <- gse54002_gene_mat[, gse54002_nontnbc_cols]
+mat_gse54002_tnbc    <- gse54002_gene_mat[, gse54002_tnbc_cols]
+
+cat("GSE54002 Non-TNBC samples:", ncol(mat_gse54002_nontnbc), "\n")
+cat("GSE54002 TNBC samples:", ncol(mat_gse54002_tnbc), "\n")
+
+# 2. Download Remaining Target TNBC GSE Cohorts
+other_gse_ids <- c("GSE157284", "GSE167213", "GSE58812", "GSE83937", "GSE95700")
+other_matrices <- list()
+
+for (id in other_gse_ids) {
+  cat("Fetching", id, "...\n")
+  gobj <- getGEO(id, GSEMatrix = TRUE)[[1]]
+  other_matrices[[id]] <- process_matrix_to_symbols(gobj)
+}
+
+# ------------------------------------------------------------------------------
+# STEP 3: Align Common Gene Features Across All Cohorts
+# ------------------------------------------------------------------------------
+cat("\n--- STEP 3: Intersecting common gene features ---\n")
+
+all_matrices_list <- c(
+  list(GSE54002_NonTNBC = mat_gse54002_nontnbc, GSE54002_TNBC = mat_gse54002_tnbc),
+  other_matrices
+)
+
+common_genes <- Reduce(intersect, lapply(all_matrices_list, rownames))
+cat("Total overlapping gene symbols across all cohorts:", length(common_genes), "\n")
+
+# Subset each matrix to common gene space
+all_matrices_aligned <- lapply(all_matrices_list, function(m) m[common_genes, ])
+
+# Column-bind in exact requested order
+combined_raw_matrix <- do.call(cbind, all_matrices_aligned)
+
+# ------------------------------------------------------------------------------
+# STEP 4: Build Structured Metadata Tracking Order & Subtypes
+# ------------------------------------------------------------------------------
+sample_ids <- colnames(combined_raw_matrix)
+
+batch_vector <- c(
+  rep("GSE54002", ncol(mat_gse54002_nontnbc) + ncol(mat_gse54002_tnbc)),
+  unlist(lapply(names(other_matrices), function(id) rep(id, ncol(other_matrices[[id]]))))
+)
+
+group_vector <- c(
+  rep("Non_TNBC", ncol(mat_gse54002_nontnbc)),
+  rep("TNBC",     ncol(mat_gse54002_tnbc)),
+  rep("TNBC",     sum(sapply(other_matrices, ncol)))
+)
+
+master_metadata <- data.frame(
+  Sample_Order = 1:length(sample_ids),
+  Sample_ID    = sample_ids,
+  Group        = group_vector,
+  Batch        = batch_vector,
+  stringsAsFactors = FALSE
+)
+
+# ------------------------------------------------------------------------------
+# STEP 5: Batch Effect Correction (ComBat) & Export
+# ------------------------------------------------------------------------------
+cat("\n--- STEP 5: Performing ComBat Batch Correction ---\n")
+
+# Model matrix preserving biological phenotype (Group) across physical GEO batches
+mod <- model.matrix(~ as.factor(Group), data = master_metadata)
+
+batch_corrected_matrix <- ComBat(
+  dat = combined_raw_matrix,
+  batch = master_metadata$Batch,
+  mod = mod,
+  par.prior = TRUE
+)
+
+# Export structured, fully processed output files to D:\TNBC_RAW
+cat("\n--- STEP 6: Saving master dataset files to D:/TNBC_RAW ---\n")
+
+fwrite(as.data.table(combined_raw_matrix, keep.rownames = "Gene_Symbol"),
+       file.path(output_dir, "Master_Raw_Aligned_Expression_Matrix.csv"))
+
+fwrite(as.data.table(batch_corrected_matrix, keep.rownames = "Gene_Symbol"),
+       file.path(output_dir, "Master_BatchCorrected_Expression_Matrix.csv"))
+
+fwrite(master_metadata, file.path(output_dir, "Master_Sample_Metadata_Ordered.csv"))
+
+# ------------------------------------------------------------------------------
+# STEP 7: PCA Visualization (Quality Control & Batch Assessment)
+# ------------------------------------------------------------------------------
+cat("\n--- STEP 7: Generating PCA Visualizations ---\n")
+
+generate_pca_plots <- function(expr_matrix, meta_df, title_prefix) {
+  pca_obj <- prcomp(t(expr_matrix), scale. = TRUE)
+  var_explained <- round(100 * (pca_obj$sdev^2 / sum(pca_obj$sdev^2)), 1)
+  
+  df_pca <- data.frame(
+    PC1   = pca_obj$x[, 1],
+    PC2   = pca_obj$x[, 2],
+    Group = meta_df$Group,
+    Batch = meta_df$Batch
+  )
+  
+  p_batch <- ggplot(df_pca, aes(x = PC1, y = PC2, color = Batch)) +
+    geom_point(alpha = 0.6, size = 1.8) +
+    theme_bw() +
+    labs(
+      title = paste0(title_prefix, ": Technical Batches"),
+      x = paste0("PC1 (", var_explained[1], "%)"),
+      y = paste0("PC2 (", var_explained[2], "%)")
+    )
+  
+  p_group <- ggplot(df_pca, aes(x = PC1, y = PC2, color = Group)) +
+    geom_point(alpha = 0.6, size = 1.8) +
+    scale_color_manual(values = c("Non_TNBC" = "#2b5c8f", "TNBC" = "#d95f02")) +
+    theme_bw() +
+    labs(
+      title = paste0(title_prefix, ": Biological Subtypes"),
+      x = paste0("PC1 (", var_explained[1], "%)"),
+      y = paste0("PC2 (", var_explained[2], "%)")
+    )
+  
+  return(list(batch = p_batch, group = p_group))
+}
+
+plots_raw       <- generate_pca_plots(combined_raw_matrix, master_metadata, "Raw Data")
+plots_corrected <- generate_pca_plots(batch_corrected_matrix, master_metadata, "ComBat Corrected")
+
+pca_panel <- grid.arrange(
+  plots_raw$batch,       plots_corrected$batch,
+  plots_raw$group,       plots_corrected$group,
+  ncol = 2, nrow = 2
+)
+
+ggsave(file.path(output_dir, "PCA_Batch_Correction_Comparison.png"), plot = pca_panel, width = 12, height = 10, dpi = 300)
+ggsave(file.path(output_dir, "PCA_Batch_Correction_Comparison.pdf"), plot = pca_panel, width = 12, height = 10)
+
+cat("Pipeline Complete! All files and plots successfully generated.\n")
